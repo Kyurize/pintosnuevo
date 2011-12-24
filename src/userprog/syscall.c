@@ -1,181 +1,189 @@
 #include "userprog/syscall.h"
+#include <stdio.h>
+#include <syscall-nr.h>
+#include "threads/interrupt.h"
+#include "threads/thread.h"
+#include "threads/init.h"
+#include "threads/vaddr.h"
+#include "userprog/process.h"
+#include "filesys/filesys.h"
+#include "filesys/file.h"
+#include "threads/vaddr.h"
+#include "threads/malloc.h"
+#include "userprog/pagedir.h"
 
-static struct lock syscall_lock;
 
 
+
+
+static int get_user (const uint8_t *uaddr);
+static bool put_user (uint8_t *udst, uint8_t byte);
+static void validate_read (const char *buffer, unsigned size);
+static void validate_write (char *from, char *user_to, unsigned size, bool malloc_buffer);
+static void validate_string (const char *string);
+
+/* Terminates Pintos by calling power_off() (declared in "threads/init.h"). 
+ This should be seldom used, because you lose some information about possible
+ deadlock situations, etc.  */
+static void halt (void) {
+  shutdown_power_off ();
+}
+
+/* Terminates the current user program, returning status to the kernel. If 
+  the process's parent waits for it (see below), this is the status that 
+  will be returned. Conventionally, a status of 0 indicates success and 
+  nonzero values indicate errors. */
+
+void exit (int status) {
+  struct thread *t = thread_current ();
+  printf("%s: exit(%d)\n", t->name, status);
+  thread_exit ();
+  NOT_REACHED ();
+}
+
+/* Runs the executable whose name is given in cmd_line, passing any 
+  given arguments, and returns the new process's program id (pid).
+  Must return pid -1, which otherwise should not be a valid pid, 
+  if the program cannot load or run for any reason. */
+static int exec (const char *cmd_line) {
+  validate_string (cmd_line);
+  tid_t tid = process_execute (cmd_line);
+  if (tid == TID_ERROR)
+    return -1;
+  return tid;
+}
+
+/* If process pid is still alive, waits until it dies. Then, returns
+ the status that pid passed to exit, or -1 if pid was terminated by 
+ the kernel (e.g. killed due to an exception). If pid does not refer 
+ to a child of the calling thread, or if wait has already been 
+ successfully called for the given pid, returns -1 immediately, 
+ without waiting. */
+static int wait (int pid){
+  return process_wait (pid);
+}
+
+
+
+/* Writes size bytes from buffer to the open file fd. Returns the number of 
+  bytes actually written, or -1 if the file could not be written. */
+static int write (int fd, const void *buffer, unsigned size){
+  validate_read(buffer, size);
+  struct file *file;
+  int result;
+  
+  if (fd == 1){
+    putbuf (buffer, size);
+    return size;
+  }
+  lock_acquire (&filesys_lock);
+  result = file_write (file, buffer, size);
+  lock_release (&filesys_lock);
+  return result;
+}
+
+
+static void syscall_handler (struct intr_frame *);
 
 void
 syscall_init (void) 
 {
+  lock_init (&filesys_lock);
   intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
-	lock_init(&syscall_lock);
 }
 
 static void
 syscall_handler (struct intr_frame *f) 
 {
-	int call;
-	int status;
-	
-	unsigned int f_des;
-	char *buffer;
-	unsigned int size;
-	int i;
-	
-	if(is_valid_arg(f->esp))
-		call = *(int*)(f->esp);
-	else
-		call = -1; /* Se ira al default del switch */
-		
-	printf ("SYSCALL\n");
-	switch(call)
-	{
-		case SYS_HALT:
-			halt();
-			break;
+  int *args = f->esp; args++;
+  int return_val = f->eax;
+  struct thread *cur = thread_current ();
 
-		case SYS_EXIT:
-			/* Revisar puntero */
-			if(is_valid_arg(f->esp+4))
-				status = *(int *)(f->esp + 4); /* Valido */
-			else
-				status = -1; /* Error */
-			
-			exit(status);
-			break;
 
-		case SYS_EXEC:
-			/* Revisar puntero */
-			if(is_valid_arg(f->esp+4))
-			{
-				status = exec((*(char **)(f->esp + 4)));; /* Valido */
-				f->eax = status;
-			}
-			else
-			{
-				status = -1;
-				exit(status);
-			}
-			/*Hay que hacer un llamado a Exec con el cmd se deberia encontrar en el esp, 
-			 no estoy seguro si es en el lugar que se encuentra el esp o el primero, asi como f->esp*/
-			break;
-		
-		case SYS_WAIT:
-			if(is_valid_arg(f->esp+4))
-			{
-				status = wait(*(tid_t *)(f->esp + 4)); /* Valido */
-				/* Retorno codigo del wait */
-				f->eax = status;
-			}
-			else
-			{
-				status = -1; /* Error */
-				exit(status);
-			}
-			break;
-			
-		case SYS_WRITE:		
-			
-			/* Verificar punteros */
-			for(i=4;i<0x0c;i+=4)
-			{
-				if(!is_valid_arg(f->esp+i))
-				{
-					exit(-1);
-					return;
-				}
-			}
-			
-			/* Estando comprobados dereferencio los punteros */
-			f_des = *(int *)f->esp+4;
-			buffer = (void *)f->esp+8;
-			size = *(int *)f->esp+12;
-			
-			f->eax = write(f_des, buffer,size); /* Retorna la cantidad de bytes escritos */
-			break;
-		
-		default:
-			printf ("INVALID SYSCALL\n");
-			exit (-1);
+  validate_read (f->esp, 1);
 
-	}
+  int sys_call = *((int *)f->esp);
+
+  switch (sys_call){
+    case SYS_HALT    : halt (); break;
+    case SYS_EXIT    : validate_read ((char *)args, 1); exit (args[0]); break;
+    case SYS_EXEC    : validate_read ((char *)args, 1); return_val = exec ((char *)args[0]); break;
+    case SYS_WAIT    : validate_read ((char *)args, 1); return_val = wait (args[0]); break; 
+    case SYS_WRITE   : validate_read ((char *)args, 3); return_val = write (args[0], (char *)args[1], args[2]); break;
+    default: exit(-1);
+  }
+
+    
+  //"return" the value back as though this were a function call
+  f->eax=return_val;
 }
 
+static void
+validate_string (const char * string) {
+  size_t i;
+  int val = -1;
+  if (string == NULL) exit(-1);
+  for(i = 0;val != 0;i++){
+  if (string + i >= (char *)PHYS_BASE) exit(-1);
+    val = get_user(string+i);
+    if (val == -1) exit(-1);
+  }
+}
 
-/*SYS_HALT:*/
+/* Validate reading from user memory */
 static void 
-halt(void)
+validate_read (const char *buffer, unsigned size)
 {
-  power_off();
+  unsigned count = 0;
+  
+  if (buffer + size >= (char *)PHYS_BASE)
+    exit(-1);
+  for (count = 0; count < size; count ++)
+    if (get_user (buffer + count) == -1)
+      exit(-1);
 }
 
-/* SYS_EXIT */
+/* Validate writing to user memory */
 static void 
-exit(int status)
+validate_write (char *from, char *user_to, unsigned size, bool malloc_buffer)
 {
-	/* TODO: Liberar los recursos extras del thread */
-	struct thread *t;
-	t = thread_current();
-	//t->ret_status = status;			
-	// Se imprime mensaje de salida
-	printf("%s: exit(%d)\n",t->name, status);
-	thread_exit ();
+  unsigned count;
+  
+  if (user_to + size >= (char *)PHYS_BASE)
+  {
+    if (malloc_buffer) free(from);
+    exit(-1);   
+  } 
+  for (count = 0; count < size; count ++) {
+    if (!put_user (user_to+count, *(from+count)))
+    {
+      if (malloc_buffer) free(from);      
+      exit(-1);     
+    } 
+  }
 }
 
-/* SYS_WRITE */
-static int 
-write(int fd, const void  *buffer, unsigned size)
-{
-	if(fd == STDOUT_FILENO) /* Solo se implemente STDOUT_FILENO */
-			{	
-			
-			/* Se escribe en la consola sicronnizando con un mutex */	
-			lock_acquire(&syscall_lock);
-				putbuf(buffer,size);
-			lock_release(&syscall_lock);
-			}
-			else /* De otra forma se retorna 0 */
-			{
-				size = 0;
-			}
-			return size;
-}
-
-/* SYS_EXEC */
-static tid_t 
-exec(const char  *cmd_line)
-{
-	/* Uso el proccess_execute de process.c y lo confirmo*/
-	/* Agrego sincronizacion con mutex */
-	lock_acquire(&syscall_lock);
-		tid_t tid = process_execute (cmd_line);
-	lock_release(&syscall_lock);
-	if (tid == TID_ERROR) 
-		return -1;
-	else return tid;
-}
-
-/* SYS_WAIT */
+/* Reads a byte at user virtual address UADDR.
+   UADDR must be below PHYS_BASE.
+   Returns the byte value if successful, -1 if a segfault
+   occurred. */
 static int
-wait(tid_t pid)
+get_user (const uint8_t *uaddr)
 {
-	/* Se llama a process_wait */
-	return process_wait(pid);
+  int result;
+  asm ("movl $1f, %0; movzbl %1, %0; 1:"
+       : "=&a" (result) : "m" (*uaddr));
+  return result;
 }
 
-/*------------------------------------------------------------------------------
- * IS_VALID_ARG: Revisa que un puntero entregado como parámetro no sea un
- * puntero nulo, un puntero a memoria virtual no mapeada o un puntero a
- * espacio de direcciones del kernel.
- *----------------------------------------------------------------------------*/ 
+/* Writes BYTE to user address UDST.
+   UDST must be below PHYS_BASE.
+   Returns true if successful, false if a segfault occurred. */
 static bool 
-is_valid_arg(void *arg)
+put_user (uint8_t *udst, uint8_t byte)
 {
-	bool value = true;
-	if(	arg == NULL																								/* Nulo */
-		||!is_user_vaddr(arg)																				/* Kernel */
-	 	||pagedir_get_page(thread_current()->pagedir, arg) == NULL) /* No mapped */
-		value = false;
-	 
-	 return value;
+  int error_code;
+  asm ("movl $1f, %0; movb %b2, %1; 1:"
+       : "=&a" (error_code), "=m" (*udst) : "r" (byte));
+  return error_code != -1;
 }
